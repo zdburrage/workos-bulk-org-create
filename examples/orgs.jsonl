@@ -1,0 +1,4 @@
+{"name":"Acme Corp","external_id":"ext_acme_001","domains":[{"domain":"acme.com","state":"verified"},{"domain":"acme.io","state":"verified"}],"metadata":{"tier":"enterprise","region":"us-east"}}
+{"name":"Globex","external_id":"ext_globex_001","domains":"globex.example:verified","metadata":{"tier":"growth"}}
+{"name":"Initech","external_id":"ext_initech_001","domains":[{"domain":"initech.test","state":"verified"},{"domain":"init.tech"}]}
+{"name":"Umbrella","external_id":"ext_umbrella_001"}

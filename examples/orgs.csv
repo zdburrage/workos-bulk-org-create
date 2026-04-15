@@ -1,0 +1,5 @@
+name,external_id,domains
+Acme Corp,ext_acme_001,acme.com|acme.io
+Globex,ext_globex_001,globex.example:verified
+Initech,ext_initech_001,initech.test:verified|init.tech:pending
+Umbrella,ext_umbrella_001,

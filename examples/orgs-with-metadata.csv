@@ -1,0 +1,5 @@
+name,external_id,domains,metadata
+Acme Corp,ext_acme_001,acme.com:verified|acme.io:verified,"{""tier"":""enterprise"",""region"":""us-east""}"
+Globex,ext_globex_001,globex.example:pending,"{""tier"":""growth""}"
+Initech,ext_initech_001,initech.test:verified|init.tech:pending,"{""tier"":""starter"",""seats"":""25""}"
+Umbrella,ext_umbrella_001,,"{""tier"":""enterprise""}"

@@ -1,0 +1,23 @@
+# Dependencies & build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Local run artifacts (results and reports are written to the repo root by default)
+results*.csv
+delete-results*.csv
+verify-report*.csv
+
+# Generated or large test fixtures (customer should generate their own)
+fixtures/
+
+# Misc
+*.log
+.DS_Store
+.idea/
+.vscode/
