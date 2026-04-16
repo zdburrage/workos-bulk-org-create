@@ -2,6 +2,12 @@
 
 All notable changes to this tool will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `wizard.ts` — zero-dependency interactive wizard (`npm start`) that walks through create / verify / delete / invite / generate-fixture flows, runs a dry-run first for destructive actions, and prints the equivalent CLI command at every step so you can script it later. No logic duplication — each flow spawns the existing script as a subprocess.
+- `invite-users.ts` — bulk-send WorkOS user-management invitations from a CSV or JSONL file. Accepts `organization_id` or `external_id` (with one-lookup-per-unique-external-id resolution and caching), optional per-row `role_slug` / `expires_in_days` / `inviter_user_id`, and matching global-default flags. Resumable via `(email, org)` key; duplicate-invite errors mapped to `skipped_existing` for clean re-runs. Safe rate-limit defaults (40 rps, concurrency 10) under the user-management writes bucket (500 req / 10s).
+
 ## [0.2.0] - 2026-04-15
 
 Initial customer release.

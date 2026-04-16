@@ -63,6 +63,35 @@ export function loadProcessedOrgIds(path: string): Set<string> {
   return done;
 }
 
+export const INVITE_RESULT_HEADER =
+  "email,organization_id,external_id,invitation_id,status,error\n";
+
+/**
+ * Returns the set of "email|organization_id" keys that are already recorded in
+ * `path` with a terminal (non-`failed`) status. Used by invite-users.ts for
+ * resumability. An email invited to two different orgs is two distinct keys.
+ */
+export function loadAlreadyInvited(path: string): Set<string> {
+  const done = new Set<string>();
+  if (!existsSync(path)) return done;
+  const rows = parseCsv(readFileSync(path, "utf8"));
+  if (rows.length <= 1) return done;
+  const header = rows[0]!.map(h => h.trim().toLowerCase());
+  const emailIdx = header.indexOf("email");
+  const orgIdx = header.indexOf("organization_id");
+  const statusIdx = header.indexOf("status");
+  if (emailIdx < 0 || orgIdx < 0) return done;
+  for (let i = 1; i < rows.length; i++) {
+    const email = rows[i]?.[emailIdx];
+    const org = rows[i]?.[orgIdx];
+    const status = statusIdx >= 0 ? rows[i]?.[statusIdx] : undefined;
+    if (email && org && status && status !== "failed") {
+      done.add(`${email}|${org}`);
+    }
+  }
+  return done;
+}
+
 /**
  * Reads a results CSV and returns the successful rows (status === "created" or "updated")
  * that have a non-empty org_id. Used by delete-orgs.ts and verify-orgs.ts.

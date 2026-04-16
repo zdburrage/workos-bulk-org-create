@@ -12,6 +12,7 @@ dist/
 results*.csv
 delete-results*.csv
 verify-report*.csv
+invite-results*.csv
 
 # Generated or large test fixtures (customer should generate their own)
 fixtures/

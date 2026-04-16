@@ -1,14 +1,26 @@
 # workos-bulk-org-create
 
-Bulk-create, update, verify, and delete WorkOS organizations from a CSV or JSONL file. Handles large batches with rate limiting, bounded concurrency, automatic retries on 429/5xx, and resumable result files.
+Bulk-create, update, verify, and delete WorkOS organizations from a CSV or JSONL file, plus bulk-send user invitations. Handles large batches with rate limiting, bounded concurrency, automatic retries on 429/5xx, and resumable result files.
 
-Scripts:
+## Quick start — interactive wizard
+
+If you'd rather not memorize flags, run:
+
+```sh
+npm start
+```
+
+The wizard walks you through each flow (create, verify, delete, invite, generate fixture), always runs dry-run first for destructive actions, and prints the equivalent CLI command at every step so you can copy-paste it into scripts later.
+
+## Scripts (direct CLI)
 
 | Script | Purpose |
 | --- | --- |
+| `npm start` / `npm run wizard` | Interactive wizard that drives everything below |
 | `npm run create` | Create organizations (and optionally update existing ones) |
 | `npm run verify` | Read-only check that WorkOS state matches the input file |
 | `npm run delete` | Delete organizations listed in a results CSV (dry-run by default) |
+| `npm run invite` | Bulk-send user-management invitations from a CSV or JSONL file |
 | `npm run generate-fixture` | Generate a large synthetic CSV/JSONL for load testing |
 
 Pass `--help` to any script for its full flag reference.
@@ -119,6 +131,34 @@ npm run delete -- --input results.csv --yes                  # actually delete
 
 Only rows with `status=created` or `status=updated` and a non-empty `org_id` are considered — the script never deletes anything that wasn't created by this tool. Writes to `delete-results.csv` (resumable).
 
+## Invite users
+
+Bulk-send WorkOS user-management invitations from a CSV or JSONL file.
+
+```sh
+npm run invite -- --input examples/invites.csv --dry-run
+npm run invite -- --input invites.csv --role-slug member
+```
+
+**Input columns** (CSV) / keys (JSONL):
+
+| Column | Required | Description |
+| --- | --- | --- |
+| `email` | yes | Recipient email |
+| `organization_id` | one of | Target org by WorkOS id |
+| `external_id` | one of | Target org by external id (resolved via WorkOS lookup and cached) |
+| `role_slug` | no | Role assigned when the recipient accepts |
+| `expires_in_days` | no | 1-30 (defaults to WorkOS's default of 7) |
+| `inviter_user_id` | no | Personalizes the invitation email |
+
+If `organization_id` is empty and `external_id` is provided, the script calls `getOrganizationByExternalId` once per unique `external_id` and caches the result.
+
+**Row-level vs. global defaults**: `--role-slug`, `--expires-in-days`, and `--inviter-user-id` apply when the row doesn't set them. Row values always win.
+
+**Idempotency**: the script records every attempt to `invite-results.csv` keyed on `email|organization_id`. Re-running appends and skips any `(email, org)` pair already recorded with a terminal non-`failed` status. Duplicate-invite errors from WorkOS are also mapped to `skipped_existing` so re-runs don't noisy-fail.
+
+`status` ∈ `invited | skipped_existing | dry_run | failed`.
+
 ## Rate limits
 
 You should not need to tune rate-limit flags — the defaults are safe for every script.
@@ -127,6 +167,7 @@ You should not need to tune rate-limit flags — the defaults are safe for every
 | --- | --- | --- | --- |
 | `create` / `verify` | 50 | 10 | 6,000 req / 60s per IP (~100 rps) |
 | `delete` | 0.75 | 1 | **50 req / 60s per API key** (~0.83 rps) |
+| `invite` | 40 | 10 | 500 req / 10s per environment (~50 rps) for `/user_management` writes |
 
 The delete endpoint is far more restrictive than the general IP bucket, so deletes take roughly `N * 1.35s` for `N` orgs. If you raise `--rps` or `--concurrency` above these defaults, the script prints a warning and you should expect 429s — retries with `Retry-After` will still eventually succeed, but the run will be slower than leaving the defaults alone. Only raise them if WorkOS support has raised your API key's limit.
 

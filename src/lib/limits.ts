@@ -29,6 +29,13 @@ export const LIMITS = {
     description:
       "WorkOS limits delete-organization to 50 requests per 60 seconds per API key (~0.83 rps)",
   },
+  /** User management writes (send invitation, etc.). 500 req / 10s per env = ~50 rps. */
+  userManagementWrite: {
+    safeRps: 40,
+    safeConcurrency: 10,
+    description:
+      "WorkOS limits /user_management writes to 500 requests per 10 seconds (~50 rps)",
+  },
 } as const satisfies Record<string, EndpointLimit>;
 
 /**

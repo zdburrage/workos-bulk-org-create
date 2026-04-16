@@ -8,10 +8,12 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "tsx src/create-orgs.ts",
+    "start": "tsx src/wizard.ts",
+    "wizard": "tsx src/wizard.ts",
     "create": "tsx src/create-orgs.ts",
     "delete": "tsx src/delete-orgs.ts",
     "verify": "tsx src/verify-orgs.ts",
+    "invite": "tsx src/invite-users.ts",
     "generate-fixture": "tsx scripts/generate-fixture.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts"

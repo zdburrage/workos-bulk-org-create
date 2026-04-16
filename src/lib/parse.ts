@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { DomainSpec, DomainState, OrgInput } from "./types.js";
+import type { DomainSpec, DomainState, InviteInput, OrgInput } from "./types.js";
 
 /** RFC-4180-ish CSV parser. Handles quoted fields, escaped quotes, CRLF, and a leading UTF-8 BOM. */
 export function parseCsv(text: string): string[][] {
@@ -212,4 +212,128 @@ export function loadJsonlInputs(text: string): OrgInput[] {
 export function loadInput(path: string, hint: "auto" | "csv" | "jsonl"): OrgInput[] {
   const text = readFileSync(resolve(path), "utf8");
   return detectFormat(path, hint) === "jsonl" ? loadJsonlInputs(text) : loadCsvInputs(text);
+}
+
+// -------------------- invitations --------------------
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function requireEmail(raw: string, where: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) throw new Error(`Missing email in ${where}`);
+  if (!EMAIL_RE.test(trimmed)) throw new Error(`Invalid email ${JSON.stringify(trimmed)} in ${where}`);
+  return trimmed;
+}
+
+function parseExpiresInDays(raw: unknown, where: string): number | undefined {
+  if (raw == null) return undefined;
+  if (typeof raw === "string") {
+    const t = raw.trim();
+    if (!t) return undefined;
+    raw = Number(t);
+  }
+  if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    throw new Error(`Invalid expires_in_days in ${where}; expected an integer 1-30`);
+  }
+  const n = Math.trunc(raw);
+  if (n < 1 || n > 30) {
+    throw new Error(`expires_in_days must be between 1 and 30 in ${where}`);
+  }
+  return n;
+}
+
+/** CSV loader for invite-users. Columns (case-insensitive):
+ *    email (required)
+ *    organization_id and/or external_id (at least one required)
+ *    role_slug (optional)
+ *    expires_in_days (optional, 1-30)
+ *    inviter_user_id (optional)
+ */
+export function loadInviteCsvInputs(text: string): InviteInput[] {
+  const rows = parseCsv(text);
+  if (rows.length === 0) return [];
+  const header = rows[0]!.map(h => h.trim().toLowerCase());
+  const emailIdx = header.indexOf("email");
+  const orgIdIdx = header.indexOf("organization_id");
+  const extIdIdx = header.indexOf("external_id");
+  const roleIdx = header.indexOf("role_slug");
+  const expIdx = header.indexOf("expires_in_days");
+  const inviterIdx = header.indexOf("inviter_user_id");
+  if (emailIdx < 0) {
+    throw new Error("CSV must include an 'email' column");
+  }
+  if (orgIdIdx < 0 && extIdIdx < 0) {
+    throw new Error("CSV must include 'organization_id' and/or 'external_id' column(s)");
+  }
+  const out: InviteInput[] = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]!;
+    const where = `row ${r + 1}`;
+    const rawEmail = (row[emailIdx] ?? "").trim();
+    if (!rawEmail) continue;
+    const email = requireEmail(rawEmail, where);
+    const organizationId = orgIdIdx >= 0 ? (row[orgIdIdx] ?? "").trim() || undefined : undefined;
+    const externalId = extIdIdx >= 0 ? (row[extIdIdx] ?? "").trim() || undefined : undefined;
+    if (!organizationId && !externalId) {
+      throw new Error(`${where}: must provide organization_id or external_id`);
+    }
+    const roleSlug = roleIdx >= 0 ? (row[roleIdx] ?? "").trim() || undefined : undefined;
+    const expiresInDays = expIdx >= 0 ? parseExpiresInDays(row[expIdx], where) : undefined;
+    const inviterUserId = inviterIdx >= 0 ? (row[inviterIdx] ?? "").trim() || undefined : undefined;
+    out.push({ email, organizationId, externalId, roleSlug, expiresInDays, inviterUserId });
+  }
+  return out;
+}
+
+/** JSONL loader for invite-users. Accepts both snake_case and camelCase keys. */
+export function loadInviteJsonlInputs(text: string): InviteInput[] {
+  const out: InviteInput[] = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!.trim();
+    if (!line) continue;
+    let obj: any;
+    try {
+      obj = JSON.parse(line);
+    } catch (e: any) {
+      throw new Error(`Invalid JSON on line ${i + 1}: ${e.message}`);
+    }
+    const where = `line ${i + 1}`;
+    const email = requireEmail(String(obj.email ?? ""), where);
+    const organizationId =
+      (typeof obj.organization_id === "string" && obj.organization_id.trim()) ||
+      (typeof obj.organizationId === "string" && obj.organizationId.trim()) ||
+      undefined;
+    const externalId =
+      (typeof obj.external_id === "string" && obj.external_id.trim()) ||
+      (typeof obj.externalId === "string" && obj.externalId.trim()) ||
+      undefined;
+    if (!organizationId && !externalId) {
+      throw new Error(`${where}: must provide organization_id or external_id`);
+    }
+    const roleSlug =
+      (typeof obj.role_slug === "string" && obj.role_slug.trim()) ||
+      (typeof obj.roleSlug === "string" && obj.roleSlug.trim()) ||
+      undefined;
+    const expiresInDays = parseExpiresInDays(
+      obj.expires_in_days ?? obj.expiresInDays,
+      where
+    );
+    const inviterUserId =
+      (typeof obj.inviter_user_id === "string" && obj.inviter_user_id.trim()) ||
+      (typeof obj.inviterUserId === "string" && obj.inviterUserId.trim()) ||
+      undefined;
+    out.push({ email, organizationId, externalId, roleSlug, expiresInDays, inviterUserId });
+  }
+  return out;
+}
+
+export function loadInviteInput(
+  path: string,
+  hint: "auto" | "csv" | "jsonl"
+): InviteInput[] {
+  const text = readFileSync(resolve(path), "utf8");
+  return detectFormat(path, hint) === "jsonl"
+    ? loadInviteJsonlInputs(text)
+    : loadInviteCsvInputs(text);
 }

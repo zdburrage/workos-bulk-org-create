@@ -1,0 +1,4 @@
+email,organization_id,external_id,role_slug,expires_in_days
+alice@acme.example,,ext_acme_001,member,14
+bob@acme.example,,ext_acme_001,admin,
+carol@globex.example,org_01HXXXXXXXXXXXXXXXXXXX,,member,7

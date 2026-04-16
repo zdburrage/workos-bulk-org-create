@@ -39,3 +39,26 @@ export type ExistingOrg = {
   metadata?: Record<string, string>;
   domains?: Array<{ domain: string; state: DomainState }>;
 };
+
+/** Per-row input for invite-users.ts. Must provide email AND (orgId OR externalId). */
+export type InviteInput = {
+  email: string;
+  /** Target org by WorkOS id. One of orgId / externalId is required. */
+  organizationId?: string;
+  /** Target org by external_id. Resolved to a WorkOS id before invitation. */
+  externalId?: string;
+  roleSlug?: string;
+  expiresInDays?: number;
+  inviterUserId?: string;
+};
+
+export type InviteStatus = "invited" | "skipped_existing" | "dry_run" | "failed";
+
+export type InviteResultRow = {
+  email: string;
+  organization_id: string;
+  external_id: string;
+  invitation_id: string;
+  status: InviteStatus;
+  error: string;
+};
