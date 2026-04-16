@@ -150,10 +150,10 @@ test("detectFormat auto-detects from extension", () => {
   assert.equal(detectFormat("foo", "auto"), "csv");
 });
 
-test("loadCsvInputs requires name and external_id columns", () => {
+test("loadCsvInputs requires name column", () => {
   assert.throws(
     () => loadCsvInputs("foo,bar\n1,2\n"),
-    /must include 'name' and 'external_id'/
+    /must include a 'name' column/
   );
 });
 
@@ -181,21 +181,26 @@ test("loadCsvInputs parses mixed per-domain states", () => {
   ]);
 });
 
-test("loadCsvInputs skips rows missing required fields", () => {
+test("loadCsvInputs skips rows missing name but keeps rows without external_id", () => {
   const text = "name,external_id\nAcme,ext_acme\n,ext_blank_name\nNoExtId,\n";
   const rows = loadCsvInputs(text);
-  assert.equal(rows.length, 1);
+  assert.equal(rows.length, 2);
   assert.equal(rows[0]!.externalId, "ext_acme");
+  assert.equal(rows[1]!.name, "NoExtId");
+  assert.equal(rows[1]!.externalId, undefined);
 });
 
 test("loadJsonlInputs accepts both external_id and externalId keys", () => {
   const text =
     '{"name":"A","external_id":"ext_a","domains":["a.com"]}\n' +
-    '{"name":"B","externalId":"ext_b","domains":"b.com|b.io"}\n';
+    '{"name":"B","externalId":"ext_b","domains":"b.com|b.io"}\n' +
+    '{"name":"C","domains":["c.com"]}\n';
   const rows = loadJsonlInputs(text);
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   assert.deepEqual(rows[0]!.domains, [{ domain: "a.com" }]);
   assert.deepEqual(rows[1]!.domains, [{ domain: "b.com" }, { domain: "b.io" }]);
+  assert.equal(rows[2]!.name, "C");
+  assert.equal(rows[2]!.externalId, undefined);
 });
 
 test("loadJsonlInputs accepts domain objects with state", () => {

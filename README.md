@@ -46,7 +46,7 @@ Header required. Recognized columns:
 | Column | Required | Description |
 | --- | --- | --- |
 | `name` | yes | Organization display name |
-| `external_id` | yes | Your stable identifier; used for idempotency and lookup |
+| `external_id` | no | Your stable identifier; used for idempotency, lookup, and resume. If omitted, the org is always created (no duplicate check) and resume uses `name`. |
 | `domains` | no | Pipe- or semicolon-separated domains, e.g. `acme.com\|acme.io`. Append `:verified` or `:pending` to set state per domain, e.g. `acme.com:verified\|acme.io:pending`. Unsuffixed domains use the global `--domain-state`. |
 | `metadata` | no | JSON object string, e.g. `{"tier":"enterprise"}` (embed quotes per CSV rules) |
 
@@ -56,7 +56,7 @@ See `examples/orgs.csv` and `examples/orgs-with-metadata.csv`.
 
 One JSON object per line. Keys:
 - `name`
-- `external_id` (or `externalId`)
+- `external_id` (or `externalId`) — optional
 - `domains` — either a delimited string (`"acme.com:verified|acme.io"`), an array of strings (`["acme.com:verified","acme.io"]`), or an array of objects (`[{"domain":"acme.com","state":"verified"},{"domain":"acme.io"}]`)
 - `metadata` — JSON object
 
@@ -207,6 +207,10 @@ Covers CSV parsing (including BOM and escaped quotes), metadata coercion, the up
 ```sh
 npm run typecheck
 ```
+
+## Using with AI agents
+
+If you plan to drive this tool via an AI coding agent (Claude Code, Cursor, Copilot, etc.), see [`AGENTS.md`](AGENTS.md) for agent-specific instructions — commands, workflow, exit codes, and common pitfalls. A Claude Code-specific [`CLAUDE.md`](CLAUDE.md) is also included.
 
 ## Support
 

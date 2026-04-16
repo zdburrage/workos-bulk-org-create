@@ -168,15 +168,15 @@ export function loadCsvInputs(text: string): OrgInput[] {
   const extIdx = header.indexOf("external_id");
   const domIdx = header.indexOf("domains");
   const metaIdx = header.indexOf("metadata");
-  if (nameIdx < 0 || extIdx < 0) {
-    throw new Error("CSV must include 'name' and 'external_id' columns");
+  if (nameIdx < 0) {
+    throw new Error("CSV must include a 'name' column");
   }
   const out: OrgInput[] = [];
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r]!;
     const name = (row[nameIdx] ?? "").trim();
-    const externalId = (row[extIdx] ?? "").trim();
-    if (!name || !externalId) continue;
+    if (!name) continue;
+    const externalId = extIdx >= 0 ? (row[extIdx] ?? "").trim() || undefined : undefined;
     const domains = domIdx >= 0 ? splitDomains(row[domIdx] ?? "") : undefined;
     const metadata = metaIdx >= 0 ? parseMetadata(row[metaIdx] ?? "") : undefined;
     out.push({ name, externalId, domains, metadata });
@@ -197,8 +197,9 @@ export function loadJsonlInputs(text: string): OrgInput[] {
       throw new Error(`Invalid JSON on line ${i + 1}: ${e.message}`);
     }
     const name = String(obj.name ?? "").trim();
-    const externalId = String(obj.external_id ?? obj.externalId ?? "").trim();
-    if (!name || !externalId) continue;
+    if (!name) continue;
+    const rawExtId = String(obj.external_id ?? obj.externalId ?? "").trim();
+    const externalId = rawExtId || undefined;
     out.push({
       name,
       externalId,

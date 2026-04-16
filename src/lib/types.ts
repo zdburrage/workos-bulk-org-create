@@ -10,7 +10,7 @@ export type DomainSpec = { domain: string; state?: DomainState };
 
 export type OrgInput = {
   name: string;
-  externalId: string;
+  externalId?: string;
   /** undefined means "not provided, don't touch"; empty array behaves the same. */
   domains?: DomainSpec[];
   metadata?: Record<string, string>;

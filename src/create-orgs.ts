@@ -1,7 +1,7 @@
 /**
  * Bulk-create (and optionally update) WorkOS organizations from CSV or JSONL input.
  *
- * CSV columns (header required): name, external_id, domains, metadata
+ * CSV columns (header required): name, external_id (optional), domains, metadata
  *   - domains: pipe/semicolon separated, e.g. "acme.com|acme.io"
  *   - metadata: JSON object string, e.g. "{""tier"":""enterprise""}"
  *
@@ -26,6 +26,7 @@ import {
   deriveErrorsPath,
   ensureHeader,
   loadAlreadyProcessed,
+  resumeKey,
   RESULT_HEADER,
 } from "./lib/results.js";
 import { statusOf, withRetries } from "./lib/retry.js";
@@ -56,7 +57,7 @@ Options:
                            Default: pending
   --max-attempts <n>       Max retry attempts on 429/5xx. Default: 6
   --limit <n>              Process at most N input rows (after --filter). Useful for a trial run.
-  --filter <regex>         Only process rows whose external_id matches this regex.
+  --filter <regex>         Only process rows whose external_id or name matches this regex.
   --update                 Also update existing orgs where fields differ from the input.
   --dry-run                Parse and diff without calling the API. No WORKOS_API_KEY needed.
   --help, -h               Show this help text.
@@ -158,13 +159,13 @@ async function findByExternalId(externalId: string): Promise<ExistingOrg | null>
 }
 
 async function createOrg(input: OrgInput): Promise<string> {
-  if (!workos) return `dry_${input.externalId}`;
+  if (!workos) return `dry_${input.externalId ?? input.name}`;
   const resolved = resolveDomainData(input, DOMAIN_STATE);
   const domainData: DomainDataInput[] | undefined =
     resolved && resolved.length ? resolved : undefined;
   const org = await workos.organizations.createOrganization({
     name: input.name,
-    externalId: input.externalId,
+    ...(input.externalId ? { externalId: input.externalId } : {}),
     ...(domainData ? { domainData } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
   } as any);
@@ -188,7 +189,7 @@ async function main() {
   const totalBeforeFilter = inputs.length;
 
   if (filterRe) {
-    inputs = inputs.filter(i => filterRe!.test(i.externalId));
+    inputs = inputs.filter(i => filterRe!.test(i.externalId ?? i.name));
   }
   if (LIMIT !== undefined) {
     inputs = inputs.slice(0, LIMIT);
@@ -208,7 +209,7 @@ async function main() {
 
   const processed = loadAlreadyProcessed(OUTPUT);
   if (processed.size) {
-    console.log(`Resuming — skipping ${processed.size} already-processed external_id(s)`);
+    console.log(`Resuming — skipping ${processed.size} already-processed row(s)`);
   }
 
   if (!DRY_RUN) warnIfOverLimit("create-orgs", LIMITS.organizationsWrite, RPS, CONCURRENCY);
@@ -239,24 +240,32 @@ async function main() {
   };
 
   await runPool(inputs, CONCURRENCY, async (input, _idx) => {
-    if (processed.has(input.externalId)) {
+    const key = resumeKey(input.externalId, input.name);
+    const label = input.externalId ?? input.name;
+    const extId = input.externalId ?? "";
+
+    if (processed.has(key)) {
       logProgress();
       return;
     }
 
     try {
-      await limiter.acquire();
-      const existing = await withRetries(
-        () => findByExternalId(input.externalId),
-        `lookup ${input.externalId}`,
-        MAX_ATTEMPTS
-      );
+      // Only look up by external_id if one is provided.
+      let existing: ExistingOrg | null = null;
+      if (input.externalId) {
+        await limiter.acquire();
+        existing = await withRetries(
+          () => findByExternalId(input.externalId!),
+          `lookup ${label}`,
+          MAX_ATTEMPTS
+        );
+      }
 
       if (existing) {
         if (!UPDATE_MODE) {
           counters.skippedExisting++;
           writeRow({
-            external_id: input.externalId,
+            external_id: extId,
             name: input.name,
             org_id: existing.id,
             status: "skipped_existing",
@@ -268,7 +277,7 @@ async function main() {
         if (!patch) {
           counters.skippedUnchanged++;
           writeRow({
-            external_id: input.externalId,
+            external_id: extId,
             name: input.name,
             org_id: existing.id,
             status: "skipped_unchanged",
@@ -279,7 +288,7 @@ async function main() {
         if (DRY_RUN) {
           counters.dry++;
           writeRow({
-            external_id: input.externalId,
+            external_id: extId,
             name: input.name,
             org_id: existing.id,
             status: "dry_run",
@@ -289,13 +298,13 @@ async function main() {
         }
         await limiter.acquire();
         await withRetries(
-          () => updateOrg(existing.id, patch),
-          `update ${input.externalId}`,
+          () => updateOrg(existing!.id, patch),
+          `update ${label}`,
           MAX_ATTEMPTS
         );
         counters.updated++;
         writeRow({
-          external_id: input.externalId,
+          external_id: extId,
           name: input.name,
           org_id: existing.id,
           status: "updated",
@@ -304,11 +313,11 @@ async function main() {
         return;
       }
 
-      // Does not exist yet.
+      // Does not exist yet (or no external_id to look up).
       if (DRY_RUN) {
         counters.dry++;
         writeRow({
-          external_id: input.externalId,
+          external_id: extId,
           name: input.name,
           org_id: "",
           status: "dry_run",
@@ -320,12 +329,12 @@ async function main() {
       await limiter.acquire();
       const orgId = await withRetries(
         () => createOrg(input),
-        `create ${input.externalId}`,
+        `create ${label}`,
         MAX_ATTEMPTS
       );
       counters.created++;
       writeRow({
-        external_id: input.externalId,
+        external_id: extId,
         name: input.name,
         org_id: orgId,
         status: "created",
@@ -334,13 +343,13 @@ async function main() {
     } catch (err: any) {
       counters.failed++;
       writeRow({
-        external_id: input.externalId,
+        external_id: extId,
         name: input.name,
         org_id: "",
         status: "failed",
         error: err?.message ?? String(err),
       });
-      console.error(`[fail] ${input.externalId}: ${err?.message ?? err}`);
+      console.error(`[fail] ${label}: ${err?.message ?? err}`);
     } finally {
       logProgress();
     }

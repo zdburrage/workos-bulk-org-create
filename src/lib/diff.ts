@@ -50,7 +50,7 @@ export function computePatch(
 ): OrgPatch | null {
   const patch: OrgPatch = {};
   if (input.name !== existing.name) patch.name = input.name;
-  if (input.externalId !== (existing.externalId ?? undefined)) {
+  if (input.externalId && input.externalId !== (existing.externalId ?? undefined)) {
     patch.externalId = input.externalId;
   }
   const desired = resolveDomainData(input, domainState);

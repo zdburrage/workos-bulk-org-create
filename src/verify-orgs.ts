@@ -45,6 +45,11 @@ Options:
 Environment:
   WORKOS_API_KEY           Required.
 
+Exit codes:
+  0   All rows match.
+  1   Fatal error (bad args, missing API key, etc.).
+  2   At least one row has verdict drift, missing, or error.
+
 Output columns: external_id, org_id, verdict, diff
   verdict ∈ { match, drift, missing, error }
 `;
@@ -121,7 +126,14 @@ async function findByExternalId(externalId: string): Promise<ExistingOrg | null>
 async function main() {
   let inputs = loadInput(INPUT!, FORMAT);
   const totalBeforeFilter = inputs.length;
-  if (filterRe) inputs = inputs.filter(i => filterRe!.test(i.externalId));
+  if (filterRe) inputs = inputs.filter(i => filterRe!.test(i.externalId ?? i.name));
+  const noExtId = inputs.filter(i => !i.externalId).length;
+  if (noExtId > 0) {
+    console.log(
+      `Skipping ${noExtId} row(s) without external_id — verify requires external_id for lookup.`
+    );
+    inputs = inputs.filter(i => !!i.externalId);
+  }
   if (LIMIT !== undefined) inputs = inputs.slice(0, LIMIT);
 
   const filterNote =
@@ -153,15 +165,16 @@ async function main() {
   await runPool(inputs, CONCURRENCY, async (input, _idx) => {
     try {
       await limiter.acquire();
+      const extId = input.externalId!;
       const existing = await withRetries(
-        () => findByExternalId(input.externalId),
-        `lookup ${input.externalId}`,
+        () => findByExternalId(extId),
+        `lookup ${extId}`,
         MAX_ATTEMPTS
       );
       if (!existing) {
         counters.missing++;
         appendRow({
-          external_id: input.externalId,
+          external_id: extId,
           org_id: "",
           verdict: "missing",
           diff: "org not found in WorkOS",
@@ -172,7 +185,7 @@ async function main() {
       if (!patch) {
         counters.match++;
         appendRow({
-          external_id: input.externalId,
+          external_id: extId,
           org_id: existing.id,
           verdict: "match",
           diff: "",
@@ -181,7 +194,7 @@ async function main() {
       }
       counters.drift++;
       appendRow({
-        external_id: input.externalId,
+        external_id: extId,
         org_id: existing.id,
         verdict: "drift",
         diff: Object.keys(patch).join(","),
@@ -189,7 +202,7 @@ async function main() {
     } catch (err: any) {
       counters.error++;
       appendRow({
-        external_id: input.externalId,
+        external_id: input.externalId ?? "",
         org_id: "",
         verdict: "error",
         diff: err?.message ?? String(err),

@@ -9,8 +9,17 @@ export function ensureHeader(path: string, header: string) {
 }
 
 /**
- * Returns the set of external_ids that are already recorded in `path` with a
+ * Returns a resume key for an org input row.
+ * Uses external_id when available, otherwise falls back to name.
+ */
+export function resumeKey(externalId?: string, name?: string): string {
+  return externalId || name || "";
+}
+
+/**
+ * Returns the set of resume keys that are already recorded in `path` with a
  * terminal (non-`failed`) status. Used to make runs resumable.
+ * Key is external_id when present, otherwise name.
  */
 export function loadAlreadyProcessed(path: string): Set<string> {
   const done = new Set<string>();
@@ -19,12 +28,14 @@ export function loadAlreadyProcessed(path: string): Set<string> {
   if (rows.length <= 1) return done;
   const header = rows[0]!.map(h => h.trim().toLowerCase());
   const extIdx = header.indexOf("external_id");
+  const nameIdx = header.indexOf("name");
   const statusIdx = header.indexOf("status");
-  if (extIdx < 0) return done;
   for (let i = 1; i < rows.length; i++) {
-    const ext = rows[i]?.[extIdx];
+    const ext = extIdx >= 0 ? (rows[i]?.[extIdx] ?? "").trim() : "";
+    const name = nameIdx >= 0 ? (rows[i]?.[nameIdx] ?? "").trim() : "";
     const status = statusIdx >= 0 ? rows[i]?.[statusIdx] : undefined;
-    if (ext && status && status !== "failed") done.add(ext);
+    const key = resumeKey(ext || undefined, name || undefined);
+    if (key && status && status !== "failed") done.add(key);
   }
   return done;
 }
