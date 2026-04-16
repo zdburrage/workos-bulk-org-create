@@ -6,9 +6,11 @@ import {
   loadCsvInputs,
   loadJsonlInputs,
   normalizeMetadata,
+  okOrgInputs,
   parseCsv,
   parseMetadata,
   splitDomains,
+  type ParsedOrgRow,
 } from "../src/lib/parse.ts";
 
 test("parseCsv handles quoted fields, commas, and escaped quotes", () => {
@@ -150,7 +152,7 @@ test("detectFormat auto-detects from extension", () => {
   assert.equal(detectFormat("foo", "auto"), "csv");
 });
 
-test("loadCsvInputs requires name column", () => {
+test("loadCsvInputs requires name column (header-level error)", () => {
   assert.throws(
     () => loadCsvInputs("foo,bar\n1,2\n"),
     /must include a 'name' column/
@@ -162,11 +164,12 @@ test("loadCsvInputs parses full row with metadata", () => {
     'name,external_id,domains,metadata\n' +
     'Acme,ext_acme,acme.com|acme.io,"{""tier"":""enterprise""}"\n';
   const rows = loadCsvInputs(text);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0]!.name, "Acme");
-  assert.equal(rows[0]!.externalId, "ext_acme");
-  assert.deepEqual(rows[0]!.domains, [{ domain: "acme.com" }, { domain: "acme.io" }]);
-  assert.deepEqual(rows[0]!.metadata, { tier: "enterprise" });
+  const inputs = okOrgInputs(rows);
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0]!.name, "Acme");
+  assert.equal(inputs[0]!.externalId, "ext_acme");
+  assert.deepEqual(inputs[0]!.domains, [{ domain: "acme.com" }, { domain: "acme.io" }]);
+  assert.deepEqual(inputs[0]!.metadata, { tier: "enterprise" });
 });
 
 test("loadCsvInputs parses mixed per-domain states", () => {
@@ -174,7 +177,8 @@ test("loadCsvInputs parses mixed per-domain states", () => {
     'name,external_id,domains\n' +
     'Acme,ext_acme,acme.com:verified|acme.io:pending|legacy.com\n';
   const rows = loadCsvInputs(text);
-  assert.deepEqual(rows[0]!.domains, [
+  const inputs = okOrgInputs(rows);
+  assert.deepEqual(inputs[0]!.domains, [
     { domain: "acme.com", state: "verified" },
     { domain: "acme.io", state: "pending" },
     { domain: "legacy.com" },
@@ -184,10 +188,38 @@ test("loadCsvInputs parses mixed per-domain states", () => {
 test("loadCsvInputs skips rows missing name but keeps rows without external_id", () => {
   const text = "name,external_id\nAcme,ext_acme\n,ext_blank_name\nNoExtId,\n";
   const rows = loadCsvInputs(text);
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0]!.externalId, "ext_acme");
-  assert.equal(rows[1]!.name, "NoExtId");
-  assert.equal(rows[1]!.externalId, undefined);
+  const inputs = okOrgInputs(rows);
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[0]!.externalId, "ext_acme");
+  assert.equal(inputs[1]!.name, "NoExtId");
+  assert.equal(inputs[1]!.externalId, undefined);
+});
+
+test("loadCsvInputs records row-level parse errors instead of aborting", () => {
+  // Row 2 has an invalid domain state; row 3 has invalid metadata JSON; row 4 is fine.
+  const text =
+    "name,external_id,domains,metadata\n" +
+    "BadDomains,ext_1,acme.com:bogus,\n" +
+    'BadMeta,ext_2,,"{not json}"\n' +
+    "Good,ext_3,acme.com,\n";
+  const rows = loadCsvInputs(text);
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0]!.ok, false);
+  assert.equal(rows[1]!.ok, false);
+  assert.equal(rows[2]!.ok, true);
+  if (!rows[0]!.ok) {
+    assert.equal(rows[0]!.rowNumber, 2);
+    assert.equal(rows[0]!.name, "BadDomains");
+    assert.equal(rows[0]!.externalId, "ext_1");
+    assert.match(rows[0]!.error, /Invalid domain state/);
+  }
+  if (!rows[1]!.ok) {
+    assert.equal(rows[1]!.rowNumber, 3);
+    assert.match(rows[1]!.error, /metadata/);
+  }
+  if (rows[2]!.ok) {
+    assert.equal(rows[2]!.input.name, "Good");
+  }
 });
 
 test("loadJsonlInputs accepts both external_id and externalId keys", () => {
@@ -196,24 +228,43 @@ test("loadJsonlInputs accepts both external_id and externalId keys", () => {
     '{"name":"B","externalId":"ext_b","domains":"b.com|b.io"}\n' +
     '{"name":"C","domains":["c.com"]}\n';
   const rows = loadJsonlInputs(text);
-  assert.equal(rows.length, 3);
-  assert.deepEqual(rows[0]!.domains, [{ domain: "a.com" }]);
-  assert.deepEqual(rows[1]!.domains, [{ domain: "b.com" }, { domain: "b.io" }]);
-  assert.equal(rows[2]!.name, "C");
-  assert.equal(rows[2]!.externalId, undefined);
+  const inputs = okOrgInputs(rows);
+  assert.equal(inputs.length, 3);
+  assert.deepEqual(inputs[0]!.domains, [{ domain: "a.com" }]);
+  assert.deepEqual(inputs[1]!.domains, [{ domain: "b.com" }, { domain: "b.io" }]);
+  assert.equal(inputs[2]!.name, "C");
+  assert.equal(inputs[2]!.externalId, undefined);
 });
 
 test("loadJsonlInputs accepts domain objects with state", () => {
   const text =
     '{"name":"A","external_id":"ext_a","domains":[{"domain":"a.com","state":"verified"},{"domain":"b.com"}]}\n';
   const rows = loadJsonlInputs(text);
-  assert.deepEqual(rows[0]!.domains, [
+  const inputs = okOrgInputs(rows);
+  assert.deepEqual(inputs[0]!.domains, [
     { domain: "a.com", state: "verified" },
     { domain: "b.com" },
   ]);
 });
 
-test("loadJsonlInputs reports line number on parse error", () => {
+test("loadJsonlInputs records invalid JSON as a failed row, not a thrown error", () => {
   const text = '{"name":"A","external_id":"ext_a"}\n{not valid\n';
-  assert.throws(() => loadJsonlInputs(text), /line 2/);
+  const rows = loadJsonlInputs(text);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.ok, true);
+  const second = rows[1]!;
+  assert.equal(second.ok, false);
+  if (!second.ok) {
+    assert.equal(second.rowNumber, 2);
+    assert.match(second.error, /line 2/);
+  }
+});
+
+test("okOrgInputs filters out parse-failed rows", () => {
+  const mixed: ParsedOrgRow[] = [
+    { ok: true, rowNumber: 2, input: { name: "A" } },
+    { ok: false, rowNumber: 3, error: "boom" },
+    { ok: true, rowNumber: 4, input: { name: "B" } },
+  ];
+  assert.deepEqual(okOrgInputs(mixed).map(i => i.name), ["A", "B"]);
 });

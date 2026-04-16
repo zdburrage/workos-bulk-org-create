@@ -18,8 +18,15 @@ import "dotenv/config";
 import { arg, flag, runPool } from "./lib/cli.js";
 import { computePatch } from "./lib/diff.js";
 import { LIMITS, warnIfOverLimit } from "./lib/limits.js";
-import { csvEscape, detectFormat, loadInput, normalizeMetadata } from "./lib/parse.js";
+import {
+  csvEscape,
+  detectFormat,
+  loadInput,
+  normalizeMetadata,
+  type ParsedOrgRow,
+} from "./lib/parse.js";
 import { RateLimiter } from "./lib/rate-limit.js";
+import { deriveErrorsPath } from "./lib/results.js";
 import { statusOf, withRetries } from "./lib/retry.js";
 import type { DomainState, ExistingOrg } from "./lib/types.js";
 
@@ -33,12 +40,13 @@ Required:
 
 Options:
   --output <path>          Verify report CSV. Default: verify-report.csv
+  --errors-output <path>   Errors-only CSV (drift/missing/error rows). Default: <output>.errors.<ext>
   --format auto|csv|jsonl  Input format. Default: auto (detected from extension)
   --rps <n>                Requests per second. Default: 50 (safe under WorkOS's ~100 rps general limit)
   --concurrency <n>        Max in-flight requests. Default: 10
   --domain-state <s>       Expected domain state for diffing. Default: pending
   --max-attempts <n>       Max retry attempts on 429/5xx. Default: 6
-  --filter <regex>         Only verify rows whose external_id matches this regex.
+  --filter <regex>         Only verify rows whose external_id or name matches this regex.
   --limit <n>              Verify at most N rows (after --filter).
   --help, -h               Show this help text.
 
@@ -63,6 +71,7 @@ if (flag(argv, "help") || flag(argv, "h")) {
 
 const INPUT = arg(argv, "input");
 const OUTPUT = arg(argv, "output", "verify-report.csv")!;
+const ERRORS_OUTPUT = arg(argv, "errors-output") ?? deriveErrorsPath(OUTPUT);
 const FORMAT = (arg(argv, "format", "auto") as "auto" | "csv" | "jsonl") ?? "auto";
 const RPS = Number(arg(argv, "rps", "50"));
 const CONCURRENCY = Number(arg(argv, "concurrency", "10"));
@@ -98,10 +107,13 @@ function ensureHeader(path: string, header: string) {
   if (!existsSync(path)) writeFileSync(path, header);
 }
 
-function appendRow(row: { external_id: string; org_id: string; verdict: string; diff: string }) {
+type VerifyRow = { external_id: string; org_id: string; verdict: string; diff: string };
+
+function appendRow(row: VerifyRow) {
   const line =
     [row.external_id, row.org_id, row.verdict, row.diff].map(csvEscape).join(",") + "\n";
   appendFileSync(OUTPUT, line);
+  if (row.verdict !== "match") appendFileSync(ERRORS_OUTPUT, line);
 }
 
 async function findByExternalId(externalId: string): Promise<ExistingOrg | null> {
@@ -124,32 +136,45 @@ async function findByExternalId(externalId: string): Promise<ExistingOrg | null>
 }
 
 async function main() {
-  let inputs = loadInput(INPUT!, FORMAT);
-  const totalBeforeFilter = inputs.length;
-  if (filterRe) inputs = inputs.filter(i => filterRe!.test(i.externalId ?? i.name));
-  const noExtId = inputs.filter(i => !i.externalId).length;
+  let rows = loadInput(INPUT!, FORMAT);
+  const totalBeforeFilter = rows.length;
+
+  if (filterRe) {
+    rows = rows.filter(r =>
+      r.ok ? filterRe!.test(r.input.externalId ?? r.input.name) : true
+    );
+  }
+
+  const noExtId = rows.filter(r => r.ok && !r.input.externalId).length;
   if (noExtId > 0) {
     console.log(
       `Skipping ${noExtId} row(s) without external_id — verify requires external_id for lookup.`
     );
-    inputs = inputs.filter(i => !!i.externalId);
+    rows = rows.filter(r => !r.ok || !!r.input.externalId);
   }
-  if (LIMIT !== undefined) inputs = inputs.slice(0, LIMIT);
+  if (LIMIT !== undefined) rows = rows.slice(0, LIMIT);
 
+  const parseFailures = rows.filter(r => !r.ok).length;
   const filterNote =
-    filterRe || LIMIT !== undefined ? ` (filtered ${inputs.length}/${totalBeforeFilter})` : "";
+    filterRe || LIMIT !== undefined ? ` (filtered ${rows.length}/${totalBeforeFilter})` : "";
   console.log(
-    `Verifying ${inputs.length} organization(s) from ${INPUT} (format=${detectFormat(INPUT!, FORMAT)})${filterNote}`
+    `Verifying ${rows.length} row(s) from ${INPUT} (format=${detectFormat(INPUT!, FORMAT)})${filterNote}`
   );
-  if (inputs.length === 0) return;
+  if (parseFailures > 0) {
+    console.log(
+      `  ${parseFailures} row(s) failed to parse and will be recorded as error verdicts.`
+    );
+  }
+  if (rows.length === 0) return;
 
   ensureHeader(OUTPUT, HEADER);
+  ensureHeader(ERRORS_OUTPUT, HEADER);
 
   warnIfOverLimit("verify-orgs", LIMITS.organizationsWrite, RPS, CONCURRENCY);
   const limiter = new RateLimiter(RPS, RPS);
   const counters = { match: 0, drift: 0, missing: 0, error: 0 };
   const started = Date.now();
-  const total = inputs.length;
+  const total = rows.length;
   let completed = 0;
   const logProgress = () => {
     completed++;
@@ -162,7 +187,20 @@ async function main() {
     }
   };
 
-  await runPool(inputs, CONCURRENCY, async (input, _idx) => {
+  await runPool(rows, CONCURRENCY, async (row: ParsedOrgRow, _idx) => {
+    if (!row.ok) {
+      counters.error++;
+      appendRow({
+        external_id: row.externalId ?? "",
+        org_id: "",
+        verdict: "error",
+        diff: `parse error (line ${row.rowNumber}): ${row.error}`,
+      });
+      logProgress();
+      return;
+    }
+
+    const input = row.input;
     try {
       await limiter.acquire();
       const extId = input.externalId!;
@@ -217,8 +255,10 @@ async function main() {
     `\nDone in ${elapsed.toFixed(1)}s — match=${counters.match} drift=${counters.drift} missing=${counters.missing} error=${counters.error}`
   );
   console.log(`Report: ${resolve(OUTPUT)}`);
-  // Non-zero exit if anything is out of spec so CI/scripts can react.
-  if (counters.drift || counters.missing || counters.error) process.exit(2);
+  if (counters.drift || counters.missing || counters.error) {
+    console.log(`Errors: ${resolve(ERRORS_OUTPUT)}`);
+    process.exit(2);
+  }
 }
 
 main().catch(err => {

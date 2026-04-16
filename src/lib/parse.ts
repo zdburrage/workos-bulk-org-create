@@ -160,7 +160,46 @@ export function detectFormat(path: string, hint: "auto" | "csv" | "jsonl"): Inpu
   return "csv";
 }
 
-export function loadCsvInputs(text: string): OrgInput[] {
+/**
+ * Per-row result of parsing a CSV/JSONL file. Header-level problems (missing
+ * required columns, empty file) still throw — those are unrecoverable. Row-
+ * level problems (bad metadata JSON, invalid domain state, etc.) become an
+ * `{ ok: false, error }` entry so the main script can record the row as a
+ * `failed` result and keep processing the rest of the file.
+ */
+export type ParsedOrgRow =
+  | { ok: true; rowNumber: number; input: OrgInput }
+  | {
+      ok: false;
+      rowNumber: number;
+      error: string;
+      name?: string;
+      externalId?: string;
+    };
+
+export type ParsedInviteRow =
+  | { ok: true; rowNumber: number; input: InviteInput }
+  | {
+      ok: false;
+      rowNumber: number;
+      error: string;
+      email?: string;
+      externalId?: string;
+      organizationId?: string;
+    };
+
+/** Helper: pull out just the successful OrgInput entries. Used by tests and any caller that doesn't care about parse errors. */
+export function okOrgInputs(rows: ParsedOrgRow[]): OrgInput[] {
+  return rows.filter((r): r is Extract<ParsedOrgRow, { ok: true }> => r.ok).map(r => r.input);
+}
+
+export function okInviteInputs(rows: ParsedInviteRow[]): InviteInput[] {
+  return rows
+    .filter((r): r is Extract<ParsedInviteRow, { ok: true }> => r.ok)
+    .map(r => r.input);
+}
+
+export function loadCsvInputs(text: string): ParsedOrgRow[] {
   const rows = parseCsv(text);
   if (rows.length === 0) return [];
   const header = rows[0]!.map(h => h.trim().toLowerCase());
@@ -171,46 +210,66 @@ export function loadCsvInputs(text: string): OrgInput[] {
   if (nameIdx < 0) {
     throw new Error("CSV must include a 'name' column");
   }
-  const out: OrgInput[] = [];
+  const out: ParsedOrgRow[] = [];
   for (let r = 1; r < rows.length; r++) {
+    const rowNumber = r + 1;
     const row = rows[r]!;
     const name = (row[nameIdx] ?? "").trim();
     if (!name) continue;
     const externalId = extIdx >= 0 ? (row[extIdx] ?? "").trim() || undefined : undefined;
-    const domains = domIdx >= 0 ? splitDomains(row[domIdx] ?? "") : undefined;
-    const metadata = metaIdx >= 0 ? parseMetadata(row[metaIdx] ?? "") : undefined;
-    out.push({ name, externalId, domains, metadata });
+    try {
+      const domains = domIdx >= 0 ? splitDomains(row[domIdx] ?? "") : undefined;
+      const metadata = metaIdx >= 0 ? parseMetadata(row[metaIdx] ?? "") : undefined;
+      out.push({ ok: true, rowNumber, input: { name, externalId, domains, metadata } });
+    } catch (e: any) {
+      out.push({
+        ok: false,
+        rowNumber,
+        error: e?.message ?? String(e),
+        name,
+        externalId,
+      });
+    }
   }
   return out;
 }
 
-export function loadJsonlInputs(text: string): OrgInput[] {
-  const out: OrgInput[] = [];
+export function loadJsonlInputs(text: string): ParsedOrgRow[] {
+  const out: ParsedOrgRow[] = [];
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!.trim();
     if (!line) continue;
+    const rowNumber = i + 1;
     let obj: any;
     try {
       obj = JSON.parse(line);
     } catch (e: any) {
-      throw new Error(`Invalid JSON on line ${i + 1}: ${e.message}`);
+      out.push({ ok: false, rowNumber, error: `Invalid JSON on line ${rowNumber}: ${e.message}` });
+      continue;
     }
     const name = String(obj.name ?? "").trim();
     if (!name) continue;
     const rawExtId = String(obj.external_id ?? obj.externalId ?? "").trim();
     const externalId = rawExtId || undefined;
-    out.push({
-      name,
-      externalId,
-      domains: splitDomains(obj.domains),
-      metadata: parseMetadata(obj.metadata),
-    });
+    try {
+      const domains = splitDomains(obj.domains);
+      const metadata = parseMetadata(obj.metadata);
+      out.push({ ok: true, rowNumber, input: { name, externalId, domains, metadata } });
+    } catch (e: any) {
+      out.push({
+        ok: false,
+        rowNumber,
+        error: e?.message ?? String(e),
+        name,
+        externalId,
+      });
+    }
   }
   return out;
 }
 
-export function loadInput(path: string, hint: "auto" | "csv" | "jsonl"): OrgInput[] {
+export function loadInput(path: string, hint: "auto" | "csv" | "jsonl"): ParsedOrgRow[] {
   const text = readFileSync(resolve(path), "utf8");
   return detectFormat(path, hint) === "jsonl" ? loadJsonlInputs(text) : loadCsvInputs(text);
 }
@@ -250,7 +309,7 @@ function parseExpiresInDays(raw: unknown, where: string): number | undefined {
  *    expires_in_days (optional, 1-30)
  *    inviter_user_id (optional)
  */
-export function loadInviteCsvInputs(text: string): InviteInput[] {
+export function loadInviteCsvInputs(text: string): ParsedInviteRow[] {
   const rows = parseCsv(text);
   if (rows.length === 0) return [];
   const header = rows[0]!.map(h => h.trim().toLowerCase());
@@ -266,41 +325,63 @@ export function loadInviteCsvInputs(text: string): InviteInput[] {
   if (orgIdIdx < 0 && extIdIdx < 0) {
     throw new Error("CSV must include 'organization_id' and/or 'external_id' column(s)");
   }
-  const out: InviteInput[] = [];
+  const out: ParsedInviteRow[] = [];
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r]!;
-    const where = `row ${r + 1}`;
+    const rowNumber = r + 1;
+    const where = `row ${rowNumber}`;
     const rawEmail = (row[emailIdx] ?? "").trim();
     if (!rawEmail) continue;
-    const email = requireEmail(rawEmail, where);
     const organizationId = orgIdIdx >= 0 ? (row[orgIdIdx] ?? "").trim() || undefined : undefined;
     const externalId = extIdIdx >= 0 ? (row[extIdIdx] ?? "").trim() || undefined : undefined;
-    if (!organizationId && !externalId) {
-      throw new Error(`${where}: must provide organization_id or external_id`);
+    try {
+      const email = requireEmail(rawEmail, where);
+      if (!organizationId && !externalId) {
+        throw new Error(`${where}: must provide organization_id or external_id`);
+      }
+      const roleSlug = roleIdx >= 0 ? (row[roleIdx] ?? "").trim() || undefined : undefined;
+      const expiresInDays = expIdx >= 0 ? parseExpiresInDays(row[expIdx], where) : undefined;
+      const inviterUserId = inviterIdx >= 0 ? (row[inviterIdx] ?? "").trim() || undefined : undefined;
+      out.push({
+        ok: true,
+        rowNumber,
+        input: { email, organizationId, externalId, roleSlug, expiresInDays, inviterUserId },
+      });
+    } catch (e: any) {
+      out.push({
+        ok: false,
+        rowNumber,
+        error: e?.message ?? String(e),
+        email: rawEmail,
+        externalId,
+        organizationId,
+      });
     }
-    const roleSlug = roleIdx >= 0 ? (row[roleIdx] ?? "").trim() || undefined : undefined;
-    const expiresInDays = expIdx >= 0 ? parseExpiresInDays(row[expIdx], where) : undefined;
-    const inviterUserId = inviterIdx >= 0 ? (row[inviterIdx] ?? "").trim() || undefined : undefined;
-    out.push({ email, organizationId, externalId, roleSlug, expiresInDays, inviterUserId });
   }
   return out;
 }
 
 /** JSONL loader for invite-users. Accepts both snake_case and camelCase keys. */
-export function loadInviteJsonlInputs(text: string): InviteInput[] {
-  const out: InviteInput[] = [];
+export function loadInviteJsonlInputs(text: string): ParsedInviteRow[] {
+  const out: ParsedInviteRow[] = [];
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!.trim();
     if (!line) continue;
+    const rowNumber = i + 1;
     let obj: any;
     try {
       obj = JSON.parse(line);
     } catch (e: any) {
-      throw new Error(`Invalid JSON on line ${i + 1}: ${e.message}`);
+      out.push({
+        ok: false,
+        rowNumber,
+        error: `Invalid JSON on line ${rowNumber}: ${e.message}`,
+      });
+      continue;
     }
-    const where = `line ${i + 1}`;
-    const email = requireEmail(String(obj.email ?? ""), where);
+    const where = `line ${rowNumber}`;
+    const rawEmail = String(obj.email ?? "").trim();
     const organizationId =
       (typeof obj.organization_id === "string" && obj.organization_id.trim()) ||
       (typeof obj.organizationId === "string" && obj.organizationId.trim()) ||
@@ -309,22 +390,38 @@ export function loadInviteJsonlInputs(text: string): InviteInput[] {
       (typeof obj.external_id === "string" && obj.external_id.trim()) ||
       (typeof obj.externalId === "string" && obj.externalId.trim()) ||
       undefined;
-    if (!organizationId && !externalId) {
-      throw new Error(`${where}: must provide organization_id or external_id`);
+    try {
+      const email = requireEmail(rawEmail, where);
+      if (!organizationId && !externalId) {
+        throw new Error(`${where}: must provide organization_id or external_id`);
+      }
+      const roleSlug =
+        (typeof obj.role_slug === "string" && obj.role_slug.trim()) ||
+        (typeof obj.roleSlug === "string" && obj.roleSlug.trim()) ||
+        undefined;
+      const expiresInDays = parseExpiresInDays(
+        obj.expires_in_days ?? obj.expiresInDays,
+        where
+      );
+      const inviterUserId =
+        (typeof obj.inviter_user_id === "string" && obj.inviter_user_id.trim()) ||
+        (typeof obj.inviterUserId === "string" && obj.inviterUserId.trim()) ||
+        undefined;
+      out.push({
+        ok: true,
+        rowNumber,
+        input: { email, organizationId, externalId, roleSlug, expiresInDays, inviterUserId },
+      });
+    } catch (e: any) {
+      out.push({
+        ok: false,
+        rowNumber,
+        error: e?.message ?? String(e),
+        email: rawEmail || undefined,
+        externalId,
+        organizationId,
+      });
     }
-    const roleSlug =
-      (typeof obj.role_slug === "string" && obj.role_slug.trim()) ||
-      (typeof obj.roleSlug === "string" && obj.roleSlug.trim()) ||
-      undefined;
-    const expiresInDays = parseExpiresInDays(
-      obj.expires_in_days ?? obj.expiresInDays,
-      where
-    );
-    const inviterUserId =
-      (typeof obj.inviter_user_id === "string" && obj.inviter_user_id.trim()) ||
-      (typeof obj.inviterUserId === "string" && obj.inviterUserId.trim()) ||
-      undefined;
-    out.push({ email, organizationId, externalId, roleSlug, expiresInDays, inviterUserId });
   }
   return out;
 }
@@ -332,7 +429,7 @@ export function loadInviteJsonlInputs(text: string): InviteInput[] {
 export function loadInviteInput(
   path: string,
   hint: "auto" | "csv" | "jsonl"
-): InviteInput[] {
+): ParsedInviteRow[] {
   const text = readFileSync(resolve(path), "utf8");
   return detectFormat(path, hint) === "jsonl"
     ? loadInviteJsonlInputs(text)

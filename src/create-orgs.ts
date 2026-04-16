@@ -19,7 +19,12 @@ import "dotenv/config";
 import { arg, flag, runPool } from "./lib/cli.js";
 import { computePatch, resolveDomainData, type OrgPatch } from "./lib/diff.js";
 import { LIMITS, warnIfOverLimit } from "./lib/limits.js";
-import { detectFormat, loadInput, normalizeMetadata } from "./lib/parse.js";
+import {
+  detectFormat,
+  loadInput,
+  normalizeMetadata,
+  type ParsedOrgRow,
+} from "./lib/parse.js";
 import { RateLimiter } from "./lib/rate-limit.js";
 import {
   appendResult,
@@ -59,6 +64,9 @@ Options:
   --limit <n>              Process at most N input rows (after --filter). Useful for a trial run.
   --filter <regex>         Only process rows whose external_id or name matches this regex.
   --update                 Also update existing orgs where fields differ from the input.
+                           Without --update, the script creates new orgs and relies on WorkOS
+                           to reject duplicate external_ids (mapped to skipped_existing), which
+                           avoids an extra lookup per row.
   --dry-run                Parse and diff without calling the API. No WORKOS_API_KEY needed.
   --help, -h               Show this help text.
 
@@ -158,6 +166,17 @@ async function findByExternalId(externalId: string): Promise<ExistingOrg | null>
   }
 }
 
+async function findOrgIdByExternalId(externalId: string): Promise<string | null> {
+  if (!workos) return null;
+  try {
+    const org = await (workos.organizations as any).getOrganizationByExternalId(externalId);
+    return org?.id ?? null;
+  } catch (err: any) {
+    if (statusOf(err) === 404) return null;
+    throw err;
+  }
+}
+
 async function createOrg(input: OrgInput): Promise<string> {
   if (!workos) return `dry_${input.externalId ?? input.name}`;
   const resolved = resolveDomainData(input, DOMAIN_STATE);
@@ -183,26 +202,82 @@ async function updateOrg(orgId: string, patch: OrgPatch): Promise<void> {
   } as any);
 }
 
+/**
+ * Detects "organization with this external_id already exists" errors so the
+ * main loop can map them to skipped_existing. We're intentionally conservative:
+ * we only return true when the error payload mentions external_id AND a
+ * collision phrase, so we don't accidentally swallow unrelated validation
+ * errors.
+ */
+function isDuplicateExternalIdError(err: any): boolean {
+  const status = statusOf(err);
+  if (status !== 409 && status !== 422 && status !== 400) return false;
+  const code = String(err?.code ?? err?.response?.data?.code ?? err?.error ?? "").toLowerCase();
+  const message = String(err?.message ?? err?.response?.data?.message ?? "").toLowerCase();
+  const errs = err?.response?.data?.errors;
+  const errsText = Array.isArray(errs)
+    ? errs
+        .map((e: any) => `${e?.code ?? ""} ${e?.message ?? ""} ${e?.field ?? ""}`)
+        .join(" ")
+        .toLowerCase()
+    : "";
+  const hay = `${code} ${message} ${errsText}`;
+  if (!/external[_\s]?id/.test(hay)) return false;
+  return /already|exists|taken|unique|duplicate|conflict/.test(hay);
+}
+
 // ---------- Main ----------
 async function main() {
-  let inputs = loadInput(INPUT!, FORMAT);
-  const totalBeforeFilter = inputs.length;
+  let rows = loadInput(INPUT!, FORMAT);
+  const totalBeforeFilter = rows.length;
 
   if (filterRe) {
-    inputs = inputs.filter(i => filterRe!.test(i.externalId ?? i.name));
+    // Apply the filter to OK rows using the resume-key fields. Parse-failed
+    // rows pass through so we always report them — they're actionable for the
+    // customer and hidden failures are worse than a few extra lines in output.
+    rows = rows.filter(r =>
+      r.ok ? filterRe!.test(r.input.externalId ?? r.input.name) : true
+    );
   }
   if (LIMIT !== undefined) {
-    inputs = inputs.slice(0, LIMIT);
+    rows = rows.slice(0, LIMIT);
   }
 
+  const parseFailures = rows.filter(r => !r.ok).length;
   const filterNote =
     filterRe || LIMIT !== undefined
-      ? ` (filtered ${inputs.length}/${totalBeforeFilter})`
+      ? ` (filtered ${rows.length}/${totalBeforeFilter})`
       : "";
   console.log(
-    `Loaded ${inputs.length} organization(s) from ${INPUT} (format=${detectFormat(INPUT!, FORMAT)}, mode=${UPDATE_MODE ? "create+update" : "create-only"})${filterNote}`
+    `Loaded ${rows.length} row(s) from ${INPUT} (format=${detectFormat(INPUT!, FORMAT)}, mode=${UPDATE_MODE ? "create+update" : "create-only"})${filterNote}`
   );
-  if (inputs.length === 0) return;
+  if (parseFailures > 0) {
+    console.log(
+      `  ${parseFailures} row(s) failed to parse and will be recorded as failed in the results CSV.`
+    );
+  }
+  if (rows.length === 0) return;
+
+  // Warn on duplicate resume keys so customers spot bad input before it silently
+  // collapses multiple rows into one result. Duplicates are allowed but rarely
+  // intended — rows sharing a key will be treated as the same org on re-runs.
+  const keyCounts = new Map<string, number>();
+  for (const r of rows) {
+    if (!r.ok) continue;
+    const k = resumeKey(r.input.externalId, r.input.name);
+    if (!k) continue;
+    keyCounts.set(k, (keyCounts.get(k) ?? 0) + 1);
+  }
+  const dupes = [...keyCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+  if (dupes.length) {
+    const preview = dupes.slice(0, 5).join(", ");
+    console.warn(
+      `\n[warn] ${dupes.length} duplicate resume key(s) detected in input.\n` +
+        `       Rows that share a key collapse to one result row; only the first is processed\n` +
+        `       (subsequent rows are skipped on re-run). Provide unique external_id values to\n` +
+        `       avoid this. First few: ${preview}${dupes.length > 5 ? ", ..." : ""}\n`
+    );
+  }
 
   ensureHeader(OUTPUT, RESULT_HEADER);
   ensureHeader(ERRORS_OUTPUT, RESULT_HEADER);
@@ -227,7 +302,7 @@ async function main() {
   const writeRow = (row: ResultRow) => appendResult(OUTPUT, row, ERRORS_OUTPUT);
 
   let completed = 0;
-  const total = inputs.length;
+  const total = rows.length;
   const logProgress = () => {
     completed++;
     if (completed % 500 === 0 || completed === total) {
@@ -239,7 +314,22 @@ async function main() {
     }
   };
 
-  await runPool(inputs, CONCURRENCY, async (input, _idx) => {
+  await runPool(rows, CONCURRENCY, async (row: ParsedOrgRow, _idx) => {
+    // Parse-failed rows: record a failed result and move on.
+    if (!row.ok) {
+      counters.failed++;
+      writeRow({
+        external_id: row.externalId ?? "",
+        name: row.name ?? "",
+        org_id: "",
+        status: "failed",
+        error: `parse error (line ${row.rowNumber}): ${row.error}`,
+      });
+      logProgress();
+      return;
+    }
+
+    const input = row.input;
     const key = resumeKey(input.externalId, input.name);
     const label = input.externalId ?? input.name;
     const extId = input.externalId ?? "";
@@ -250,9 +340,11 @@ async function main() {
     }
 
     try {
-      // Only look up by external_id if one is provided.
+      // Only pre-fetch the full org when we actually need it for diffing
+      // (update mode). In create-only mode we skip the lookup and rely on the
+      // WorkOS API to reject duplicate external_ids, which halves API calls.
       let existing: ExistingOrg | null = null;
-      if (input.externalId) {
+      if (UPDATE_MODE && input.externalId) {
         await limiter.acquire();
         existing = await withRetries(
           () => findByExternalId(input.externalId!),
@@ -262,17 +354,6 @@ async function main() {
       }
 
       if (existing) {
-        if (!UPDATE_MODE) {
-          counters.skippedExisting++;
-          writeRow({
-            external_id: extId,
-            name: input.name,
-            org_id: existing.id,
-            status: "skipped_existing",
-            error: "",
-          });
-          return;
-        }
         const patch = computePatch(input, existing, DOMAIN_STATE);
         if (!patch) {
           counters.skippedUnchanged++;
@@ -313,7 +394,6 @@ async function main() {
         return;
       }
 
-      // Does not exist yet (or no external_id to look up).
       if (DRY_RUN) {
         counters.dry++;
         writeRow({
@@ -326,20 +406,51 @@ async function main() {
         return;
       }
 
-      await limiter.acquire();
-      const orgId = await withRetries(
-        () => createOrg(input),
-        `create ${label}`,
-        MAX_ATTEMPTS
-      );
-      counters.created++;
-      writeRow({
-        external_id: extId,
-        name: input.name,
-        org_id: orgId,
-        status: "created",
-        error: "",
-      });
+      try {
+        await limiter.acquire();
+        const orgId = await withRetries(
+          () => createOrg(input),
+          `create ${label}`,
+          MAX_ATTEMPTS
+        );
+        counters.created++;
+        writeRow({
+          external_id: extId,
+          name: input.name,
+          org_id: orgId,
+          status: "created",
+          error: "",
+        });
+      } catch (err: any) {
+        // Idempotent skip when the external_id already exists (create-only mode
+        // doesn't pre-check, so we learn about duplicates from the create call).
+        if (input.externalId && isDuplicateExternalIdError(err)) {
+          let orgId = "";
+          try {
+            await limiter.acquire();
+            orgId =
+              (await withRetries(
+                () => findOrgIdByExternalId(input.externalId!),
+                `lookup-after-dup ${label}`,
+                MAX_ATTEMPTS
+              )) ?? "";
+          } catch {
+            // Best-effort: if the follow-up lookup fails, we still record the
+            // skipped_existing status without an org_id. Customer can run
+            // verify to reconcile.
+          }
+          counters.skippedExisting++;
+          writeRow({
+            external_id: extId,
+            name: input.name,
+            org_id: orgId,
+            status: "skipped_existing",
+            error: `already-exists: ${err?.message ?? err}`,
+          });
+          return;
+        }
+        throw err;
+      }
     } catch (err: any) {
       counters.failed++;
       writeRow({

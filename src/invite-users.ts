@@ -16,9 +16,18 @@ import "dotenv/config";
 
 import { arg, flag, runPool } from "./lib/cli.js";
 import { LIMITS, warnIfOverLimit } from "./lib/limits.js";
-import { csvEscape, detectFormat, loadInviteInput } from "./lib/parse.js";
+import {
+  csvEscape,
+  detectFormat,
+  loadInviteInput,
+  type ParsedInviteRow,
+} from "./lib/parse.js";
 import { RateLimiter } from "./lib/rate-limit.js";
-import { INVITE_RESULT_HEADER, loadAlreadyInvited } from "./lib/results.js";
+import {
+  deriveErrorsPath,
+  INVITE_RESULT_HEADER,
+  loadAlreadyInvited,
+} from "./lib/results.js";
 import { statusOf, withRetries } from "./lib/retry.js";
 import type { InviteInput, InviteResultRow, InviteStatus } from "./lib/types.js";
 
@@ -72,8 +81,7 @@ if (flag(argv, "help") || flag(argv, "h")) {
 
 const INPUT = arg(argv, "input");
 const OUTPUT = arg(argv, "output", "invite-results.csv")!;
-const ERRORS_OUTPUT =
-  arg(argv, "errors-output") ?? OUTPUT.replace(/\.([^.]+)$/, ".errors.$1") ?? "invite-results.errors.csv";
+const ERRORS_OUTPUT = arg(argv, "errors-output") ?? deriveErrorsPath(OUTPUT);
 const FORMAT = (arg(argv, "format", "auto") as "auto" | "csv" | "jsonl") ?? "auto";
 const RPS = Number(arg(argv, "rps", "40"));
 const CONCURRENCY = Number(arg(argv, "concurrency", "10"));
@@ -182,7 +190,7 @@ function isDuplicateInviteError(err: any): boolean {
   return (
     code.includes("invitation_already_exists") ||
     code.includes("already_invited") ||
-    msg.includes("already") && msg.includes("invit")
+    (msg.includes("already") && msg.includes("invit"))
   );
 }
 
@@ -203,24 +211,33 @@ async function sendInvitation(
 }
 
 async function main() {
-  let inputs: InviteInput[];
+  let rows: ParsedInviteRow[];
   try {
-    inputs = loadInviteInput(INPUT!, FORMAT);
+    rows = loadInviteInput(INPUT!, FORMAT);
   } catch (e: any) {
+    // Header-level errors (missing email column, etc.) still abort.
     console.error(`Failed to parse ${INPUT}: ${e.message}`);
     process.exit(1);
   }
 
-  const totalBeforeFilter = inputs.length;
-  if (filterRe) inputs = inputs.filter(i => filterRe!.test(i.email));
-  if (LIMIT !== undefined) inputs = inputs.slice(0, LIMIT);
+  const totalBeforeFilter = rows.length;
+  if (filterRe) {
+    rows = rows.filter(r => (r.ok ? filterRe!.test(r.input.email) : true));
+  }
+  if (LIMIT !== undefined) rows = rows.slice(0, LIMIT);
 
+  const parseFailures = rows.filter(r => !r.ok).length;
   const filterNote =
-    filterRe || LIMIT !== undefined ? ` (filtered ${inputs.length}/${totalBeforeFilter})` : "";
+    filterRe || LIMIT !== undefined ? ` (filtered ${rows.length}/${totalBeforeFilter})` : "";
   console.log(
-    `${DRY_RUN ? "DRY-RUN" : "INVITE"} — ${inputs.length} invitation(s) from ${INPUT} (format=${detectFormat(INPUT!, FORMAT)})${filterNote}`
+    `${DRY_RUN ? "DRY-RUN" : "INVITE"} — ${rows.length} row(s) from ${INPUT} (format=${detectFormat(INPUT!, FORMAT)})${filterNote}`
   );
-  if (inputs.length === 0) return;
+  if (parseFailures > 0) {
+    console.log(
+      `  ${parseFailures} row(s) failed to parse and will be recorded as failed in the results CSV.`
+    );
+  }
+  if (rows.length === 0) return;
 
   ensureHeader(OUTPUT, INVITE_RESULT_HEADER);
   ensureHeader(ERRORS_OUTPUT, INVITE_RESULT_HEADER);
@@ -234,7 +251,7 @@ async function main() {
   const limiter = new RateLimiter(RPS, RPS);
   const counters = { invited: 0, skipped: 0, failed: 0, dry_run: 0 };
   const started = Date.now();
-  const total = inputs.length;
+  const total = rows.length;
   let completed = 0;
   const logProgress = () => {
     completed++;
@@ -252,7 +269,22 @@ async function main() {
     if (row.status === "failed") appendRow(ERRORS_OUTPUT, row);
   };
 
-  await runPool(inputs, CONCURRENCY, async (input, _idx) => {
+  await runPool(rows, CONCURRENCY, async (row: ParsedInviteRow, _idx) => {
+    if (!row.ok) {
+      counters.failed++;
+      record({
+        email: row.email ?? "",
+        organization_id: row.organizationId ?? "",
+        external_id: row.externalId ?? "",
+        invitation_id: "",
+        status: "failed",
+        error: `parse error (line ${row.rowNumber}): ${row.error}`,
+      });
+      logProgress();
+      return;
+    }
+
+    const input = row.input;
     const externalId = input.externalId ?? "";
     try {
       const orgId = await resolveOrgId(input);
